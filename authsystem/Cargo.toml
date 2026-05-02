@@ -1,0 +1,40 @@
+[package]
+name = "authsystem"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+axum = { version = "0.7.9", features = ["macros"] }
+axum-macros = "0.5"
+chrono = { version = "0.4.44", features = ["serde"] }
+
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "uuid", "chrono", "macros"] }
+dotenvy = "0.15.7"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-executor-trait = "3.1.0"
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
+validator = { version = "0.20.0", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+
+# For high-security password hashing
+argon2 = "0.5"
+# For creating and signing the JWTs
+jsonwebtoken = "9.3"
+
+# For rendering the Login HTML
+askama = { version = "0.12", features = ["with-axum"] }
+askama_axum = "0.4"
+
+# Main session management
+tower-sessions = "0.12.2"
+tower-sessions-redis-store = "0.12.0"
+
+# Time handling for session durations
+time = "0.3"
