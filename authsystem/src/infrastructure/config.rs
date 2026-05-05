@@ -5,7 +5,6 @@ pub struct Config {
     pub database_url: String,
     pub server_port: u16,
     pub environment: String,
-    pub redis_url: String,
 }
 
 impl Config {
@@ -19,7 +18,6 @@ impl Config {
                 .parse()
                 .unwrap(),
             environment: env::var("ENVIRONMENT").expect("********ENVIRONMENT is required*******"),
-            redis_url: env::var("REDIS_URL").expect("********REDIS_URL is required*********"),
         }
     }
 }

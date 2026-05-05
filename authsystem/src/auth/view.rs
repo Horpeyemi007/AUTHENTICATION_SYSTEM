@@ -7,11 +7,11 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tower_sessions::Session;
-use tower_sessions_redis_store::fred::interfaces::KeysInterface;
-use tower_sessions_redis_store::fred::types::Expiration;
+use uuid::Uuid;
 
 use super::repo::find_oauth_client;
 use super::{create_jwt, generate_auth_code, verify_user_password};
@@ -61,6 +61,7 @@ pub struct TokenResponse {
 pub struct OAuthSession {
     pub user_id: uuid::Uuid,
     pub client_id: String,
+    pub expires_at: Option<i64>,
 }
 
 // GET "/auth/login"
@@ -87,12 +88,13 @@ pub async fn handle_login(
         Ok(None) => {
             return Redirect::to("/auth/login?error=Invalid+email+or+password").into_response();
         }
-        Err(_) => {
+        Err(e) => {
+            eprintln!("Error occurred: {}", e);
             return Redirect::to("/auth/login?error=Invalid+email+or+password").into_response();
         }
     };
 
-    // verify_password in spawn_blocking due to argon to small delay
+    // verify_password in spawn_blocking due to argon2 small delay
     let password_hash = user.password_hash.clone();
     let password = payload.password.clone();
     let is_valid_password =
@@ -143,39 +145,15 @@ pub async fn handle_authorize(
             if !client.redirect_uris.contains(&params.redirect_uri) {
                 return (StatusCode::BAD_REQUEST, "Invalid redirect url").into_response();
             }
-            // generate the authentication code and also save in redis temporarily (5 mins)
+            // generate the authentication code and also save in session temporarily (5 mins)
             let auth_code = generate_auth_code();
             let session_data = OAuthSession {
                 user_id: user_id.unwrap(),
                 client_id: params.client_id,
-            };
-            let redis_key = format!("auth_code:{}", auth_code);
-            let auth_code_session_data = match serde_json::to_string(&session_data) {
-                Ok(j) => j,
-                Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Serialization error")
-                        .into_response();
-                }
+                expires_at: None,
             };
 
-            if let Err(e) = state
-                .redis
-                .set::<(), _, _>(
-                    redis_key,
-                    auth_code_session_data,
-                    Some(Expiration::EX(300)),
-                    None,
-                    false,
-                )
-                .await
-            {
-                eprint!("Redis Error: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to save auth code",
-                )
-                    .into_response();
-            }
+            state.auth_codes.insert(auth_code.clone(), session_data);
 
             let redirect_url = format!(
                 "{}?code={}&state={}",
@@ -194,17 +172,20 @@ pub async fn handle_authorize(
 
 // POST "/auth/token" 2nd handshake
 pub async fn handle_generate_token(
+    session: Session,
     State(state): State<AppState>,
     Form(payload): Form<TokenRequest>,
 ) -> impl IntoResponse {
     match payload.grant_type.as_str() {
-        "authorization_code" => handle_auth_code_grant(state, payload).await,
+        "authorization_code" => handle_auth_code_grant(state, session, payload).await,
+        "refresh_token" => handle_refresh_token_grant(state, session, payload).await,
         _ => (StatusCode::UNPROCESSABLE_ENTITY, "Unsupported grant type").into_response(),
     }
 }
 
 async fn handle_auth_code_grant(
     state: AppState,
+    session: Session,
     payload: TokenRequest,
 ) -> axum::response::Response {
     // validate the client
@@ -234,33 +215,88 @@ async fn handle_auth_code_grant(
         return (StatusCode::UNAUTHORIZED, "Invalid redirect URI").into_response();
     }
 
-    // verify and delete the auth code from redis
-    let redis_key = format!("auth_code:{}", code);
-    let auth_code_session_data: Option<String> = match state.redis.getdel(&redis_key).await {
-        Ok(data) => data,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Redis error").into_response(),
-    };
-
-    let redis_data: OAuthSession = match auth_code_session_data {
-        Some(json) => serde_json::from_str(&json).unwrap(),
+    // get and remove the auth code (one time)
+    let session_data: OAuthSession = match state.auth_codes.remove(&code) {
+        Some((_, data)) => data,
         None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Invalid or expired token",
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, "Invalid or expired auth code").into_response();
         }
     };
     // create access token
     let user_permission = vec!["read:patients".to_string(), "write:patients".to_string()];
-    let access_token = create_jwt(&redis_data.user_id, &payload.client_id, user_permission);
+    let access_token = create_jwt(&session_data.user_id, &payload.client_id, user_permission);
+
+    // generate the refresh token also
+    let refresh_token =
+        generate_refresh_token(session, session_data.user_id, payload.client_id).await;
 
     // return tokens
     let response = TokenResponse {
         access_token,
         token_type: "Bearer".to_string(),
         expires_in: 3600,
-        refresh_token: None,
+        refresh_token: Some(refresh_token),
+        scope: client.scopes,
+    };
+
+    Json(response).into_response()
+}
+
+async fn handle_refresh_token_grant(
+    state: AppState,
+    session: Session,
+    payload: TokenRequest,
+) -> axum::response::Response {
+    // get refresh token from payload
+    let refresh_token = match payload.refresh_token.as_deref() {
+        Some(t) => t.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "Missing refresh token").into_response(),
+    };
+
+    // validate client and secret
+    let client = match validate_client(
+        &state.db,
+        &payload.client_id,
+        payload.client_secret.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    // fetch, validate and delete the token from session
+    let token_key = format!("refresh_token:{}", refresh_token);
+    let token_session: Option<OAuthSession> = session.get(&token_key).await.unwrap_or(None);
+
+    let token_data = match token_session {
+        Some(token) => {
+            if Utc::now().timestamp() > token.expires_at.unwrap() {
+                let _ = session.remove::<OAuthSession>(&token_key).await;
+                return (StatusCode::UNAUTHORIZED, "Refresh token expired").into_response();
+            }
+            let _ = session.remove::<OAuthSession>(&token_key).await;
+            token
+        }
+        None => return (StatusCode::UNAUTHORIZED, "Invalid refresh token").into_response(),
+    };
+    // verify refresh token belongs to this client
+    if token_data.client_id != payload.client_id {
+        return (StatusCode::UNAUTHORIZED, "Client mismatch").into_response();
+    }
+    // issue new access token
+    let user_permissions = vec!["read:patients".to_string(), "write:patients".to_string()];
+    let new_access_token = create_jwt(&token_data.user_id, &token_data.client_id, user_permissions);
+    // generate new refresh token (rotation)
+    let refresh_token =
+        generate_refresh_token(session, token_data.user_id, token_data.client_id).await;
+
+    // return tokens
+    let response = TokenResponse {
+        access_token: new_access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: 3600,
+        refresh_token: Some(refresh_token),
         scope: client.scopes,
     };
 
@@ -283,4 +319,20 @@ async fn validate_client(
     }
 
     Ok(client)
+}
+
+// @INFO: needs to verify if this is in a different session (Will test it when i implemented the client system)
+async fn generate_refresh_token(session: Session, user_id: Uuid, client_id: String) -> String {
+    let refresh_token = generate_auth_code();
+    let token_key = format!("refresh_token:{}", refresh_token);
+
+    let session_data = OAuthSession {
+        user_id,
+        client_id,
+        expires_at: Some(Utc::now().timestamp() + (60 * 3)), // 3 minutes
+    };
+
+    let _ = session.insert(&token_key, session_data).await;
+
+    return refresh_token;
 }

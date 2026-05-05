@@ -38,3 +38,5 @@ tower-sessions-redis-store = "0.12.0"
 
 # Time handling for session durations
 time = "0.3"
+
+dashmap = "6"

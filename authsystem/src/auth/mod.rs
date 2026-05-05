@@ -3,6 +3,7 @@ mod repo;
 mod view;
 
 pub use authutil::*;
+pub use view::*;
 
 use crate::routes::AppState;
 use axum::{Router, routing::get, routing::post};
